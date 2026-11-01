@@ -1,0 +1,89 @@
+# Builds Linux bundles (deb, rpm, AppImage) for x86_64 and aarch64 using the
+# official tauri-action on GitHub-hosted runners. The aarch64 job uses the
+# ubuntu-22.04-arm runner, which is free for public repositories.
+#
+# Note: `libudev-dev` is required by the `serialport` crate; without it the
+# build fails in `libudev-sys`'s build script.
+
+name: 'build-linux'
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            libudev-dev \
+            libssl-dev \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - name: build bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: backend
+          args: --bundles deb,rpm,appimage
+          # Only create a (draft) GitHub release when a v* tag is pushed.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && 'v__VERSION__' || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && 'OBDium v__VERSION__' || '' }}
+          releaseDraft: true
+          prerelease: false
+
+      - name: upload bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: obdium-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            backend/target/release/bundle/deb/*.deb
+            backend/target/release/bundle/rpm/*.rpm
+            backend/target/release/bundle/appimage/*.AppImage
