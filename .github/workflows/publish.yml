@@ -17,6 +17,12 @@ on:
     tags:
       - 'v*'
 
+env:
+  # Set to a short identifier (e.g. a GitHub username) on forks so release
+  # titles and asset filenames are distinguishable from upstream's. Leave empty
+  # on the upstream repository.
+  FORK_SUFFIX: syndr
+
 jobs:
   create-release:
     permissions:
@@ -41,11 +47,16 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            const suffix = process.env.FORK_SUFFIX;
+            const name = suffix
+              ? `OBDium ${tag} (${suffix} fork build)`
+              : `OBDium v${process.env.PACKAGE_VERSION}`;
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: context.ref.replace("refs/tags/", ""),
-              name: `OBDium v${process.env.PACKAGE_VERSION}`,
+              tag_name: tag,
+              name,
               body: 'See the assets below to download and install this version.',
               draft: true,
               prerelease: false
@@ -116,6 +127,8 @@ jobs:
           projectPath: backend
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
+          # e.g. obdium_1.5.1_arm64-syndr.deb; default Tauri names when FORK_SUFFIX is empty.
+          releaseAssetNamePattern: ${{ env.FORK_SUFFIX != '' && format('[name]_[version]_[arch]-{0}[setup][ext]', env.FORK_SUFFIX) || '' }}
 
   publish-release:
     permissions:
