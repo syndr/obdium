@@ -202,10 +202,16 @@ impl OBD {
             return Ok(());
         }
 
-        self.connection = serialport::new(port, baud_rate)
+        self.connection = match serialport::new(port, baud_rate)
             .timeout(Duration::from_secs(1))
             .open()
-            .ok();
+        {
+            Ok(connection) => Some(connection),
+            Err(err) => {
+                println!("error opening serial port {port}: {err}");
+                None
+            }
+        };
 
         if self.is_connected() {
             let initialized = self.init();
@@ -257,21 +263,41 @@ impl OBD {
         }
     }
 
+    /// Default pseudo-terminal created by the `ble-serial` bridge.
+    const BLE_BRIDGE_PORT: &str = "/tmp/ttyBLE";
+
     pub fn get_open_serial_ports() -> Vec<(String, u32)> {
-        let ports = match serialport::available_ports() {
-            Ok(p) => p,
+        let mut port_names: Vec<String> = match serialport::available_ports() {
+            Ok(p) => p.into_iter().map(|port| port.port_name).collect(),
             Err(err) => {
                 println!("error getting available serial ports: {err}");
-                return Vec::new();
+                Vec::new()
             }
         };
 
-        const BAUD_RATES: [u32; 6] = [38400, 9600, 115200, 57600, 230400, 4800];
-        let handles: Vec<_> = ports
+        // Ports the OS does not enumerate, such as the pseudo-terminal of a
+        // BLE-to-serial bridge. OBDIUM_EXTRA_PORTS takes a list of paths in
+        // the platform's PATH format.
+        let extra_ports = std::env::var_os("OBDIUM_EXTRA_PORTS")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default()
             .into_iter()
-            .map(|port| {
+            .chain(std::iter::once(std::path::PathBuf::from(
+                Self::BLE_BRIDGE_PORT,
+            )));
+
+        for path in extra_ports {
+            let name = path.to_string_lossy().into_owned();
+            if !name.is_empty() && path.exists() && !port_names.contains(&name) {
+                port_names.push(name);
+            }
+        }
+
+        const BAUD_RATES: [u32; 6] = [38400, 9600, 115200, 57600, 230400, 4800];
+        let handles: Vec<_> = port_names
+            .into_iter()
+            .map(|port_name| {
                 std::thread::spawn(move || {
-                    let port_name = port.port_name;
                     for baud_rate in BAUD_RATES.iter() {
                         let Ok(mut con) = serialport::new(&port_name, *baud_rate)
                             .timeout(Duration::from_millis(500))
