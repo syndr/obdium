@@ -263,6 +263,9 @@ impl OBD {
         }
     }
 
+    /// How many read timeouts to wait for an initialization command.
+    const INIT_ATTEMPTS: usize = 5;
+
     /// Default pseudo-terminal created by the `ble-serial` bridge.
     const BLE_BRIDGE_PORT: &str = "/tmp/ttyBLE";
 
@@ -385,9 +388,35 @@ impl OBD {
             let response = if self.replay_requests {
                 self.get_recorded_response(&command)
             } else {
-                self.send_command(&mut command)
-                    .map_err(|_| Error::InitFailedSendingCommand(command.as_string()))?;
-                self.get_at_response()?
+                let is_reset = command.get_at() == b"ATZ";
+                let mut response = Response::default();
+
+                // Adapters on slow links (e.g. Bluetooth) can take longer
+                // than one read timeout to come back from a reset, and drop
+                // whatever is sent to them in the meantime. Keep waiting for
+                // the reset banner, and resend the other commands until
+                // they are acknowledged.
+                for attempt in 0..Self::INIT_ATTEMPTS {
+                    if attempt == 0 || !is_reset {
+                        self.send_command(&mut command)
+                            .map_err(|_| Error::InitFailedSendingCommand(command.as_string()))?;
+                    }
+
+                    response = self.get_at_response()?;
+                    let data = response.formatted_response.as_deref().unwrap_or_default();
+                    let done = if is_reset {
+                        // The echoed command alone is not the banner yet.
+                        !data.replace("ATZ", "").trim().is_empty()
+                    } else {
+                        data.contains("OK")
+                    };
+
+                    if done {
+                        break;
+                    }
+                }
+
+                response
             };
 
             if self.record_requests {
