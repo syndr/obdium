@@ -6,7 +6,8 @@
 #   ADDRESS=AA:BB:CC:DD:EE:FF
 #   CHANNEL=1
 #
-# Install:
+# The obdium-bluetooth-setup script next to this file installs and configures
+# it. To install by hand:
 #   sudo install -m 644 rfcomm-bind@.service /etc/systemd/system/
 #   sudo systemctl enable --now rfcomm-bind@0.service
 #

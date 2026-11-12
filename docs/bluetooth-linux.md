@@ -25,6 +25,24 @@ profile. Check before assuming (step 2 below); the classic route is simpler.
 
 ## Classic adapters (rfcomm)
 
+### Quick setup
+
+[`contrib/linux/obdium-bluetooth-setup`](../contrib/linux/obdium-bluetooth-setup)
+does the steps below for you: it scans, lets you pick your adapter, detects
+the serial channel, binds it and keeps the binding across reboots. It asks
+for `sudo` only when it changes the system.
+
+```sh
+contrib/linux/obdium-bluetooth-setup            # interactive setup
+contrib/linux/obdium-bluetooth-setup list       # only show nearby devices
+contrib/linux/obdium-bluetooth-setup status     # show configured bindings
+contrib/linux/obdium-bluetooth-setup remove 0   # undo the binding for /dev/rfcomm0
+```
+
+If you already know the address, `setup --address AA:BB:CC:DD:EE:FF --yes`
+runs without questions. Then continue at
+[Connect in OBDium](#5-connect-in-obdium). The manual steps follow.
+
 ### 1. Find the adapter's address
 
 ```sh
