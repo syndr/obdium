@@ -717,7 +717,10 @@ impl OBD {
             None => return Err(Error::NoConnection),
         };
 
-        port.clear(serialport::ClearBuffer::All)
+        // Only discard pending input here. Clearing the output buffer would
+        // drop a command that was just written but not transmitted yet,
+        // which happens on Bluetooth (rfcomm) serial ports.
+        port.clear(serialport::ClearBuffer::Input)
             .map_err(|error| 
                 match error.kind() {
                     NoDevice => Error::NoConnection,
