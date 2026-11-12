@@ -202,10 +202,16 @@ impl OBD {
             return Ok(());
         }
 
-        self.connection = serialport::new(port, baud_rate)
+        self.connection = match serialport::new(port, baud_rate)
             .timeout(Duration::from_secs(1))
             .open()
-            .ok();
+        {
+            Ok(connection) => Some(connection),
+            Err(err) => {
+                println!("error opening serial port {port}: {err}");
+                None
+            }
+        };
 
         if self.is_connected() {
             let initialized = self.init();
@@ -257,21 +263,44 @@ impl OBD {
         }
     }
 
+    /// How many read timeouts to wait for an initialization command.
+    const INIT_ATTEMPTS: usize = 5;
+
+    /// Default pseudo-terminal created by the `ble-serial` bridge.
+    const BLE_BRIDGE_PORT: &str = "/tmp/ttyBLE";
+
     pub fn get_open_serial_ports() -> Vec<(String, u32)> {
-        let ports = match serialport::available_ports() {
-            Ok(p) => p,
+        let mut port_names: Vec<String> = match serialport::available_ports() {
+            Ok(p) => p.into_iter().map(|port| port.port_name).collect(),
             Err(err) => {
                 println!("error getting available serial ports: {err}");
-                return Vec::new();
+                Vec::new()
             }
         };
 
-        const BAUD_RATES: [u32; 6] = [38400, 9600, 115200, 57600, 230400, 4800];
-        let handles: Vec<_> = ports
+        // Ports the OS does not enumerate, such as the pseudo-terminal of a
+        // BLE-to-serial bridge. OBDIUM_EXTRA_PORTS takes a list of paths in
+        // the platform's PATH format.
+        let extra_ports = std::env::var_os("OBDIUM_EXTRA_PORTS")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default()
             .into_iter()
-            .map(|port| {
+            .chain(std::iter::once(std::path::PathBuf::from(
+                Self::BLE_BRIDGE_PORT,
+            )));
+
+        for path in extra_ports {
+            let name = path.to_string_lossy().into_owned();
+            if !name.is_empty() && path.exists() && !port_names.contains(&name) {
+                port_names.push(name);
+            }
+        }
+
+        const BAUD_RATES: [u32; 6] = [38400, 9600, 115200, 57600, 230400, 4800];
+        let handles: Vec<_> = port_names
+            .into_iter()
+            .map(|port_name| {
                 std::thread::spawn(move || {
-                    let port_name = port.port_name;
                     for baud_rate in BAUD_RATES.iter() {
                         let Ok(mut con) = serialport::new(&port_name, *baud_rate)
                             .timeout(Duration::from_millis(500))
@@ -359,9 +388,35 @@ impl OBD {
             let response = if self.replay_requests {
                 self.get_recorded_response(&command)
             } else {
-                self.send_command(&mut command)
-                    .map_err(|_| Error::InitFailedSendingCommand(command.as_string()))?;
-                self.get_at_response()?
+                let is_reset = command.get_at() == b"ATZ";
+                let mut response = Response::default();
+
+                // Adapters on slow links (e.g. Bluetooth) can take longer
+                // than one read timeout to come back from a reset, and drop
+                // whatever is sent to them in the meantime. Keep waiting for
+                // the reset banner, and resend the other commands until
+                // they are acknowledged.
+                for attempt in 0..Self::INIT_ATTEMPTS {
+                    if attempt == 0 || !is_reset {
+                        self.send_command(&mut command)
+                            .map_err(|_| Error::InitFailedSendingCommand(command.as_string()))?;
+                    }
+
+                    response = self.get_at_response()?;
+                    let data = response.formatted_response.as_deref().unwrap_or_default();
+                    let done = if is_reset {
+                        // The echoed command alone is not the banner yet.
+                        !data.replace("ATZ", "").trim().is_empty()
+                    } else {
+                        data.contains("OK")
+                    };
+
+                    if done {
+                        break;
+                    }
+                }
+
+                response
             };
 
             if self.record_requests {
@@ -662,7 +717,10 @@ impl OBD {
             None => return Err(Error::NoConnection),
         };
 
-        port.clear(serialport::ClearBuffer::All)
+        // Only discard pending input here. Clearing the output buffer would
+        // drop a command that was just written but not transmitted yet,
+        // which happens on Bluetooth (rfcomm) serial ports.
+        port.clear(serialport::ClearBuffer::Input)
             .map_err(|error| 
                 match error.kind() {
                     NoDevice => Error::NoConnection,

@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+#
+# Set up a classic Bluetooth (SPP) ELM327 adapter as a permanent serial
+# device (/dev/rfcomm<N>) for OBDium.
+#
+# See docs/bluetooth-linux.md for the manual steps and for BLE-only adapters.
+
+set -euo pipefail
+
+PROGRAM=$(basename "$0")
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CONFIG_DIR=/etc/rfcomm-bind
+UNIT_NAME=rfcomm-bind@.service
+UNIT_PATH=/etc/systemd/system/$UNIT_NAME
+GUIDE_URL=https://github.com/provrb/obdium/blob/main/docs/bluetooth-linux.md
+
+# Device names that usually belong to OBD adapters.
+LIKELY_NAMES='OBD|ELM|VEEPEAK|VGATE|VLINK|KONNWEI|ICAR|SCAN'
+
+ADDRESS=
+CHANNEL=
+DEVICE_NUMBER=
+SCAN_TIME=15
+ASSUME_YES=0
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM [command] [options]
+
+Commands:
+  setup        Find a Bluetooth OBD adapter, bind it to /dev/rfcomm<N> and
+               keep the binding across reboots (default)
+  list         Scan and show nearby Bluetooth devices, change nothing
+  status       Show configured bindings
+  remove [N]   Remove the binding for /dev/rfcomm<N> (default 0)
+
+Options for setup:
+  --address MAC     Use this adapter instead of scanning and asking
+  --channel N       RFCOMM channel (default: detected from the adapter)
+  --device N        rfcomm device number (default: first free)
+  --scan-time SECS  How long to scan (default: $SCAN_TIME; also for list)
+  --yes             Do not ask for confirmation
+  -h, --help        Show this help
+
+Before scanning: plug the adapter into the vehicle, disconnect any phone
+from it, and stay within a few metres.
+EOF
+}
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+confirm() {
+    local answer
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    read -r -p "$1 [y/N] " answer || return 1
+    [[ $answer =~ ^[Yy] ]]
+}
+
+valid_address() {
+    [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+check_dependencies() {
+    local missing=() tool
+    for tool in bluetoothctl rfcomm sdptool systemctl; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        die "missing tools: ${missing[*]}. Install BlueZ (Debian/Ubuntu: sudo apt install bluez)."
+    fi
+}
+
+ensure_radio_on() {
+    if command -v rfkill >/dev/null 2>&1 &&
+        rfkill list bluetooth 2>/dev/null | grep -q 'Soft blocked: yes'; then
+        info "Bluetooth is blocked, unblocking it."
+        rfkill unblock bluetooth 2>/dev/null || as_root rfkill unblock bluetooth
+        sleep 1
+    fi
+    if ! bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then
+        bluetoothctl power on >/dev/null 2>&1 || true
+        sleep 1
+    fi
+    bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' ||
+        die "could not turn the Bluetooth radio on. Check 'rfkill list' and 'bluetoothctl show'."
+}
+
+# Signal strength of a device in dBm, empty when it was not seen in the scan.
+device_rssi() {
+    bluetoothctl info "$1" 2>/dev/null |
+        sed -n 's/^[[:space:]]*RSSI:[[:space:]]*\(.*\)$/\1/p' |
+        sed -n 's/.*(\(-\{0,1\}[0-9]\{1,\}\)).*/\1/p; t; s/^\(-\{0,1\}[0-9]\{1,\}\)$/\1/p' |
+        head -n 1
+}
+
+# Fills the DEVICES array with "likely<TAB>rssi<TAB>address<TAB>name" lines,
+# likely adapters first, then strongest signal first.
+DEVICES=()
+scan_devices() {
+    local address name rssi likely lines="" scan_pid
+
+    # BlueZ only reports signal strength while a scan is running, so the
+    # results are collected just before it ends.
+    info "Scanning for $SCAN_TIME seconds..."
+    bluetoothctl --timeout "$((SCAN_TIME + 5))" scan on >/dev/null 2>&1 &
+    scan_pid=$!
+    sleep "$SCAN_TIME"
+
+    while read -r _ address name; do
+        valid_address "$address" || continue
+        rssi=$(device_rssi "$address")
+        likely=0
+        if printf '%s' "$name" | grep -qiE "$LIKELY_NAMES"; then
+            likely=1
+        fi
+        # Devices remembered from earlier that did not answer this scan are
+        # only worth showing when they look like an adapter.
+        [ -z "$rssi" ] && [ "$likely" -eq 0 ] && continue
+        lines+="$likely"$'\t'"${rssi:--999}"$'\t'"$address"$'\t'"$name"$'\n'
+    done < <(bluetoothctl devices 2>/dev/null)
+
+    kill "$scan_pid" 2>/dev/null || true
+    wait "$scan_pid" 2>/dev/null || true
+
+    DEVICES=()
+    [ -n "$lines" ] || return 0
+    mapfile -t DEVICES < <(printf '%s' "$lines" | sort -t $'\t' -k1,1nr -k2,2nr)
+}
+
+show_devices() {
+    if [ "${#DEVICES[@]}" -eq 0 ]; then
+        info "No Bluetooth devices found. Is the adapter powered, in range and not"
+        info "connected to a phone?"
+        return 0
+    fi
+
+    local index=1 line likely rssi address name signal note
+    printf '\n %3s  %-17s  %-9s  %s\n' '#' 'Address' 'Signal' 'Name'
+    for line in "${DEVICES[@]}"; do
+        IFS=$'\t' read -r likely rssi address name <<<"$line"
+        if [ "$rssi" = "-999" ]; then
+            signal='not seen'
+        else
+            signal="$rssi dBm"
+        fi
+        note=
+        [ "$likely" = "1" ] && note='  <- looks like an OBD adapter'
+        printf ' %3d  %-17s  %-9s  %s%s\n' "$index" "$address" "$signal" "$name" "$note"
+        index=$((index + 1))
+    done
+    printf '\n'
+    if printf '%s\n' "${DEVICES[@]}" | grep -q $'\t-999\t'; then
+        info "'not seen' devices are remembered from earlier and did not answer this scan."
+    fi
+}
+
+# Sets ADDRESS from the user's choice.
+select_device() {
+    local choice line
+    while true; do
+        scan_devices
+        show_devices
+        read -r -p "Adapter number, r to rescan, q to quit: " choice || exit 1
+        case $choice in
+            q | Q) exit 0 ;;
+            r | R | '') continue ;;
+        esac
+        if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#DEVICES[@]}" ]; then
+            line=${DEVICES[$((choice - 1))]}
+            ADDRESS=$(printf '%s' "$line" | cut -f3)
+            return 0
+        fi
+        info "Not a valid choice: $choice"
+    done
+}
+
+# Sets CHANNEL to the adapter's Serial Port RFCOMM channel.
+find_serial_channel() {
+    local records channel
+    info "Asking $ADDRESS for its serial port service..."
+    records=$(sdptool browse "$ADDRESS" 2>&1 || true)
+    channel=$(printf '%s\n' "$records" | awk '
+        BEGIN { RS = ""; FS = "\n" }
+        /\(0x1101\)/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /Channel:/) {
+                    sub(/.*Channel:[ \t]*/, "", $i)
+                    print $i
+                    exit
+                }
+            }
+        }')
+
+    if [[ $channel =~ ^[0-9]+$ ]]; then
+        CHANNEL=$channel
+        info "Serial port found on RFCOMM channel $CHANNEL."
+        return 0
+    fi
+
+    if printf '%s' "$records" | grep -q 'Service RecHandle'; then
+        die "$ADDRESS has no classic serial port service. It is probably a BLE-only adapter.
+See the BLE section of $GUIDE_URL"
+    fi
+    die "$ADDRESS did not answer. Check that it is powered, in range and not connected to a phone.
+A BLE-only adapter also ends up here; see $GUIDE_URL
+If you know the channel, pass it with --channel (usually 1)."
+}
+
+# Sets DEVICE_NUMBER: the number already used for this address, else the
+# first one that is neither configured nor bound to another adapter.
+pick_rfcomm_number() {
+    local conf number bound
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        if grep -qi "^ADDRESS=$ADDRESS\$" "$conf"; then
+            DEVICE_NUMBER=$(basename "$conf" .conf)
+            return 0
+        fi
+    done
+
+    bound=$(rfcomm -a 2>/dev/null || true)
+    for number in $(seq 0 31); do
+        [ -e "$CONFIG_DIR/$number.conf" ] && continue
+        if printf '%s\n' "$bound" | grep -q "^rfcomm$number:"; then
+            # A manual bind of this same adapter can be taken over.
+            printf '%s\n' "$bound" | grep -qi "^rfcomm$number: $ADDRESS " || continue
+        fi
+        DEVICE_NUMBER=$number
+        return 0
+    done
+    die "no free rfcomm device number."
+}
+
+unit_file_contents() {
+    if [ -r "$SCRIPT_DIR/$UNIT_NAME" ]; then
+        cat "$SCRIPT_DIR/$UNIT_NAME"
+        return 0
+    fi
+    cat <<'EOF'
+# Binds a classic Bluetooth (SPP) serial adapter to /dev/rfcomm<N> at boot.
+# Settings are read from /etc/rfcomm-bind/<N>.conf (ADDRESS=, CHANNEL=).
+# Installed by obdium-bluetooth-setup.
+
+[Unit]
+Description=Bind Bluetooth serial adapter to /dev/rfcomm%i
+Documentation=https://github.com/provrb/obdium/blob/main/docs/bluetooth-linux.md
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CHANNEL=1
+EnvironmentFile=/etc/rfcomm-bind/%i.conf
+ExecStartPre=-/usr/bin/rfcomm release %i
+ExecStart=/usr/bin/rfcomm bind %i ${ADDRESS} ${CHANNEL}
+ExecStop=/usr/bin/rfcomm release %i
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_binding() {
+    local service="rfcomm-bind@$DEVICE_NUMBER.service"
+    local rfcomm_path
+    rfcomm_path=$(command -v rfcomm)
+
+    info ""
+    info "About to set up:"
+    info "  adapter   $ADDRESS (channel $CHANNEL)"
+    info "  device    /dev/rfcomm$DEVICE_NUMBER"
+    info "  config    $CONFIG_DIR/$DEVICE_NUMBER.conf"
+    info "  service   $service (enabled at boot)"
+    confirm "Continue?" || die "cancelled, nothing was changed."
+
+    unit_file_contents | sed "s|/usr/bin/rfcomm|$rfcomm_path|g" |
+        as_root tee "$UNIT_PATH" >/dev/null
+    as_root chmod 644 "$UNIT_PATH"
+    as_root mkdir -p "$CONFIG_DIR"
+    printf 'ADDRESS=%s\nCHANNEL=%s\n' "$ADDRESS" "$CHANNEL" |
+        as_root tee "$CONFIG_DIR/$DEVICE_NUMBER.conf" >/dev/null
+    as_root systemctl daemon-reload
+    as_root systemctl enable "$service" >/dev/null 2>&1
+    as_root systemctl restart "$service"
+
+    local _attempt
+    for _attempt in 1 2 3 4 5; do
+        [ -e "/dev/rfcomm$DEVICE_NUMBER" ] && break
+        sleep 1
+    done
+    [ -e "/dev/rfcomm$DEVICE_NUMBER" ] ||
+        die "/dev/rfcomm$DEVICE_NUMBER was not created. See: systemctl status $service"
+    info "Bound $ADDRESS to /dev/rfcomm$DEVICE_NUMBER."
+}
+
+# Returns 1 when the user cannot open the device until they log in again.
+ensure_dialout() {
+    local device="/dev/rfcomm$DEVICE_NUMBER" group user
+    [ -r "$device" ] && [ -w "$device" ] && return 0
+
+    group=$(stat -c %G "$device")
+    user=$(id -un)
+    if id -nG "$user" | tr ' ' '\n' | grep -qx "$group"; then
+        warn "you are in group '$group' but this session predates it. Log out and back in."
+        return 1
+    fi
+    info "Your user '$user' cannot open $device (it belongs to group '$group')."
+    if confirm "Add '$user' to group '$group'?"; then
+        as_root usermod -aG "$group" "$user"
+        info "Added. Log out and back in for it to take effect."
+    fi
+    return 1
+}
+
+# Sends ATI and prints the adapter's answer.
+test_adapter() {
+    local device="/dev/rfcomm$DEVICE_NUMBER" reply _attempt
+    info "Testing the adapter (this opens the Bluetooth link)..."
+    for _attempt in 1 2; do
+        # shellcheck disable=SC2016
+        reply=$(timeout 25 bash -c '
+            exec 3<>"$1" || exit 1
+            stty raw -echo <&3 2>/dev/null
+            printf "ATI\r" >&3
+            IFS= read -r -t 6 -d ">" -u 3 answer
+            printf "%s" "$answer"
+        ' _ "$device" 2>/dev/null | tr '\r' '\n' | grep -v '^ATI$' | grep -v '^[[:space:]]*$' | head -n 1 || true)
+        if [ -n "$reply" ]; then
+            info "Adapter answered: $reply"
+            return 0
+        fi
+        sleep 2
+    done
+
+    warn "the adapter did not answer on $device. The binding is in place; check that:"
+    cat >&2 <<EOF
+  - the adapter is powered (plugged into the vehicle) and within a few metres
+  - no phone or other program (OBDium included) is connected to it
+  - it does not need pairing first. If it does, the PIN is usually 1234 or 0000:
+        bluetoothctl pair $ADDRESS
+        bluetoothctl trust $ADDRESS
+Then run: $PROGRAM status
+EOF
+    return 1
+}
+
+cmd_list() {
+    check_dependencies
+    ensure_radio_on
+    scan_devices
+    show_devices
+}
+
+cmd_setup() {
+    check_dependencies
+
+    if [ -n "$ADDRESS" ]; then
+        valid_address "$ADDRESS" || die "not a Bluetooth address: $ADDRESS"
+    else
+        info "Plug the adapter into the vehicle, disconnect any phone from it,"
+        info "and stay within a few metres."
+        ensure_radio_on
+        select_device
+    fi
+    ADDRESS=${ADDRESS^^}
+
+    ensure_radio_on
+    [ -n "$CHANNEL" ] || find_serial_channel
+    [[ $CHANNEL =~ ^[0-9]+$ ]] || die "not a channel number: $CHANNEL"
+    [ -n "$DEVICE_NUMBER" ] || pick_rfcomm_number
+    [[ $DEVICE_NUMBER =~ ^[0-9]+$ ]] || die "not a device number: $DEVICE_NUMBER"
+
+    install_binding
+    if ensure_dialout; then
+        test_adapter || true
+    fi
+
+    info ""
+    info "Done. In OBDium, refresh the port list (it can take 15 seconds) and"
+    info "select /dev/rfcomm$DEVICE_NUMBER."
+}
+
+cmd_status() {
+    local conf number found=0
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        found=1
+        number=$(basename "$conf" .conf)
+        info "/dev/rfcomm$number"
+        sed 's/^/  /' "$conf"
+        info "  service: $(systemctl is-enabled "rfcomm-bind@$number.service" 2>/dev/null || true)," \
+            "$(systemctl is-active "rfcomm-bind@$number.service" 2>/dev/null || true)"
+    done
+    [ "$found" -eq 1 ] || info "No bindings configured in $CONFIG_DIR."
+    info ""
+    info "Current rfcomm devices:"
+    rfcomm -a 2>/dev/null | sed 's/^/  /' || true
+}
+
+cmd_remove() {
+    local number=${1:-0}
+    [[ $number =~ ^[0-9]+$ ]] || die "not a device number: $number"
+    [ -e "$CONFIG_DIR/$number.conf" ] || die "no binding configured for /dev/rfcomm$number."
+    confirm "Remove the binding for /dev/rfcomm$number?" || die "cancelled."
+    as_root systemctl disable --now "rfcomm-bind@$number.service" >/dev/null 2>&1 || true
+    as_root rm -f "$CONFIG_DIR/$number.conf"
+    info "Removed the binding for /dev/rfcomm$number."
+}
+
+main() {
+    local command=setup positional=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            setup | list | status | remove)
+                command=$1
+                ;;
+            --address)
+                ADDRESS=${2:?--address needs a value}
+                shift
+                ;;
+            --channel)
+                CHANNEL=${2:?--channel needs a value}
+                shift
+                ;;
+            --device)
+                DEVICE_NUMBER=${2:?--device needs a value}
+                shift
+                ;;
+            --scan-time)
+                SCAN_TIME=${2:?--scan-time needs a value}
+                shift
+                ;;
+            --yes | -y) ASSUME_YES=1 ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            -*) die "unknown option: $1 (see --help)" ;;
+            *) positional+=("$1") ;;
+        esac
+        shift
+    done
+    [[ $SCAN_TIME =~ ^[0-9]+$ ]] || die "not a number of seconds: $SCAN_TIME"
+
+    case $command in
+        setup) cmd_setup ;;
+        list) cmd_list ;;
+        status) cmd_status ;;
+        remove) cmd_remove "${positional[@]}" ;;
+    esac
+}
+
+main "$@"
