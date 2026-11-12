@@ -537,6 +537,28 @@ impl OBD {
         let ecu_names = OBD::extract_ecu_names(&response);
         let escaped = response.clone();
 
+        let legacy_frames = OBD::extract_legacy_frames(&response);
+        if let Some((_, first_frame)) = legacy_frames.first() {
+            let service = first_frame[0].as_bytes();
+            let all_data: Vec<&str> = legacy_frames
+                .iter()
+                .flat_map(|(_, data)| data.iter().map(String::as_str))
+                .collect();
+
+            let mut meta_data = Response::no_data();
+            meta_data.responding_ecus = legacy_frames
+                .iter()
+                .map(|(source, _)| source.clone())
+                .collect();
+            meta_data.formatted_response = Some(all_data.join(" "));
+            meta_data.raw_response = Some(escaped);
+            meta_data.payload_size = first_frame.len();
+            meta_data.service = [service[0], service[1]];
+            meta_data.payload = Some(first_frame.join(" "));
+
+            return Ok(meta_data);
+        }
+
         response = response.replace(" ", "").replace("\n", "").replacen(
             format!("{:02X}", payload_size).as_str(),
             "",
@@ -693,6 +715,57 @@ impl OBD {
             .collect()
     }
 
+    /// Splits a response from a non-CAN protocol (J1850, ISO 9141, KWP2000)
+    /// into the source address and data bytes of each frame.
+    ///
+    /// With headers on, these protocols print one frame per line as a
+    /// three byte header, the data, and a checksum:
+    ///
+    /// 48 6B 10 41 0C 1A F8 C4
+    ///
+    /// Where:
+    ///     48 6B - priority and target address
+    ///     10    - source address (the responding ECU)
+    ///     41 0C 1A F8 - the data
+    ///     C4    - checksum
+    ///
+    /// Returns nothing for CAN responses, which start with a CAN id.
+    pub fn extract_legacy_frames(response: &str) -> Vec<(String, Vec<String>)> {
+        const HEADER_SIZE: usize = 3;
+
+        response
+            .split(['\r', '\n'])
+            .filter_map(|line| {
+                let bytes: Vec<&str> = line.split_whitespace().collect();
+
+                // header, at least one data byte, checksum
+                if bytes.len() < HEADER_SIZE + 2 {
+                    return None;
+                }
+
+                let is_hex_bytes = bytes
+                    .iter()
+                    .all(|byte| byte.len() == 2 && byte.bytes().all(|c| c.is_ascii_hexdigit()));
+                if !is_hex_bytes {
+                    return None;
+                }
+
+                // 29-bit CAN ids are also printed as two character bytes.
+                if bytes[0] == "18" && (bytes[1] == "DA" || bytes[1] == "DB") {
+                    return None;
+                }
+
+                let source = bytes[HEADER_SIZE - 1].to_string();
+                let data = bytes[HEADER_SIZE..bytes.len() - 1]
+                    .iter()
+                    .map(|byte| byte.to_string())
+                    .collect();
+
+                Some((source, data))
+            })
+            .collect()
+    }
+
     pub fn extract_payload_size(response: &str) -> u32 {
         response
             .split_whitespace()
@@ -782,6 +855,36 @@ impl OBD {
         let mut response = self.read_until(b'>').unwrap_or_default();
         response = response.replace("SEARCHING...", "");
 
+        // Non-CAN protocols do not use ISO-TP; every line is a complete
+        // frame. A service 09 response (e.g. the VIN) repeats the service
+        // and pid in each frame, followed by a sequence number and data:
+        //
+        // 48 6B 10 49 02 01 00 00 00 31 69 - Frame 1
+        // 48 6B 10 49 02 02 47 4E 45 4B DE - Frame 2
+        //
+        // For those, keep the layout of the CAN payload: a record number
+        // followed by the data. Other services (e.g. trouble codes) are
+        // returned as they were sent.
+        let legacy_frames = OBD::extract_legacy_frames(&response);
+        if let Some((first_source, first_frame)) = legacy_frames.first() {
+            const DATA_OFFSET: usize = 3;
+
+            if first_frame[0] == "49" {
+                payload.push("01".to_string());
+                for (source, data) in &legacy_frames {
+                    if source == first_source && data.len() > DATA_OFFSET {
+                        payload.extend(data[DATA_OFFSET..].iter().cloned());
+                    }
+                }
+            } else {
+                for (_, data) in &legacy_frames {
+                    payload.extend(data.iter().cloned());
+                }
+            }
+
+            return payload;
+        }
+
         let ecu_names = OBD::extract_ecu_names(&response);
         OBD::strip_ecu_names(&mut response, ecu_names.as_slice());
 
@@ -841,7 +944,13 @@ impl OBD {
 
         // Convert hex payload to ASCII string
         let mut vin = String::new();
-        for byte in self.read_iso_tp_response().iter().skip(1) {
+        // Non-CAN protocols pad the first frame of the VIN with null bytes.
+        for byte in self
+            .read_iso_tp_response()
+            .iter()
+            .skip(1)
+            .filter(|byte| byte.as_str() != "00")
+        {
             vin.push(
                 u8::from_str_radix(byte, 16)
                     .map(|s| s as char)
