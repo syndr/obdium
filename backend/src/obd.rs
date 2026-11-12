@@ -624,6 +624,13 @@ impl OBD {
             ];
             let response = self.query(Command::new_pid(&command));
 
+            // The ECU did not answer for this range (e.g. "NO DATA").
+            // Parsing that text as a bitmask would report pids that
+            // do not exist.
+            if *response.get_payload_size() == 0 {
+                continue;
+            }
+
             let split = format!("41{}", request_pid);
 
             let mut parsed: HashMap<String, Vec<String>> = self.parse_supported_pids(
