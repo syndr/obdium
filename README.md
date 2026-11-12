@@ -91,6 +91,8 @@ For a full user manual, view the docs [here.](https://provrb.github.io/obdium/)
    - Optionally change or leave the `OBD-II Protocol` and `Baud Rate` settings as is
 5. Click **Connect** and wait for the notification telling you the connection was established
 
+Using a Bluetooth adapter on Linux? See [Bluetooth adapters on Linux](docs/bluetooth-linux.md).
+
 ### Understanding each feature
 
 - OBD data will be recorded in the **OBD Dashboard**

@@ -1,0 +1,32 @@
+# Binds a classic Bluetooth (SPP) serial adapter to /dev/rfcomm<N> at boot.
+#
+# The instance name is the rfcomm device number. Settings are read from
+# /etc/rfcomm-bind/<N>.conf:
+#
+#   ADDRESS=AA:BB:CC:DD:EE:FF
+#   CHANNEL=1
+#
+# Install:
+#   sudo install -m 644 rfcomm-bind@.service /etc/systemd/system/
+#   sudo systemctl enable --now rfcomm-bind@0.service
+#
+# See docs/bluetooth-linux.md.
+
+[Unit]
+Description=Bind Bluetooth serial adapter to /dev/rfcomm%i
+Documentation=https://github.com/provrb/obdium/blob/main/docs/bluetooth-linux.md
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CHANNEL=1
+EnvironmentFile=/etc/rfcomm-bind/%i.conf
+# Drop a stale binding first so restarts and manual binds do not conflict.
+ExecStartPre=-/usr/bin/rfcomm release %i
+ExecStart=/usr/bin/rfcomm bind %i ${ADDRESS} ${CHANNEL}
+ExecStop=/usr/bin/rfcomm release %i
+
+[Install]
+WantedBy=multi-user.target
